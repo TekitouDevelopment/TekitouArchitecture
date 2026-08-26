@@ -9,41 +9,36 @@ module main (
     output logic [63:0] debug_rd_val, // 計算結果が書き込まれるレジスタの値
     output logic [63:0] debug_reg1,   // レジスタ1番の値
     output logic [63:0] debug_reg2,   // レジスタ2番の値
-    output logic [63:0] debug_reg3    // レジスタ3番の値
+    output logic [63:0] debug_reg3,   // レジスタ3番の値
+    output logic [63:0] debug_pc      // PCの値
 );
+
     // 1. プログラムカウンタ
     logic [63:0] pc;
 
-    // 2. ROM（命令メモリ）
-    logic [63:0] rom [0:3];
+    // 2. ROM（命令メモリ：0〜7）
+    logic [63:0] rom [0:7];
 
     initial begin
-        rom[0] = {16'd0,  5'd0,  5'd0,  5'd0,  32'd0,  1'b0};
-        rom[1] = {16'd2,  5'd1,  5'd0,  5'd0,  32'd30,  1'b0};
-        rom[2] = {16'd2,  5'd2,  5'd0,  5'd0,  32'd20,  1'b0};
-        rom[3] = {16'd1,  5'd3,  5'd1,  5'd2,  32'd00,  1'b0};
+        // NOPスタートのプログラム構成
+        rom[0] = {16'd0,  5'd0,  5'd0,  5'd0,  32'd0,   1'b0}; // NOP (何もしない)
+        rom[1] = {16'd1,  5'd1,  5'd0,  5'd0,  32'd30,  1'b0}; // Load r1, 30
+        rom[2] = {16'd1,  5'd2,  5'd0,  5'd0,  32'd20,  1'b0}; // Load r2, 20
+        rom[3] = {16'd4,  5'd0,  5'd0,  5'd0,  32'd40,  1'b0}; // JMP  40 (アドレス40 = rom[5]の位置へジャンプ)
+        rom[4] = {16'd2,  5'd3,  5'd1,  5'd2,  32'd00,  1'b0}; // （ここはスキップされるはず！）
+        rom[5] = {16'd2,  5'd3,  5'd1,  5'd2,  32'd00,  1'b0}; // ADD  r3 = r1 + r2 (ジャンプ先)
+        rom[6] = {16'd0,  5'd0,  5'd0,  5'd0,  32'd0,   1'b0};
+        rom[7] = {16'd0,  5'd0,  5'd0,  5'd0,  32'd0,   1'b0};
     end
 
-    // PCの更新（8バイト刻み）
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst) begin
-            pc <= 64'h0;
-        end else begin
-            pc <= pc + 64'h8;
-        end
-    end
-
+    // 命令フェッチ（PCから即座に命令を取り出す）
     always_comb begin
-        // pc >> 3 が 4 未満のとき
-        if ((pc >> 3) < 4) begin
-            inst = rom[pc[4:3]];
+        if ((pc >> 3) < 8) begin
+            inst = rom[pc[5:3]];
         end else begin
             inst = 64'b0;
         end
     end
-
-    // 3. レジスタファイル（王道の32個に拡張！）
-    logic [63:0] regs [0:31];
 
     // デコード用のワイヤー
     logic [15:0] opcode;
@@ -60,28 +55,64 @@ module main (
     assign imm      = inst[32:1];  // 32bit
     assign reserved = inst[0];     // 1bit
 
+    // ★ ここがポイント：今読んでいる命令がジャンプ（16'h0004）なら、次のPCを即座に即値にする！
+    logic [63:0] next_pc;
+    always_comb begin
+        if (opcode == 16'h0004) begin
+            next_pc = {32'h0, imm}; // ジャンプ先へワープ
+        end else begin
+            next_pc = pc + 64'h8;   // 通常は次へ進む
+        end
+    end
+
+    // PCの更新（組み合わせ回路で決まった next_pc をそのまま受け取る）
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            pc <= 64'h0;
+        end else begin
+            pc <= next_pc;
+        end
+    end
+
+    // 3. レジスタファイル（32個）
+    logic [63:0] regs [0:31];
+
     // 4. 実行＆レジスタ書き込み部分
     always_ff @(posedge clk or posedge rst) begin
         if (rst) begin
-            // 32個すべてを初期化
             for (int i = 0; i < 32; i++) begin
                 regs[i] <= 64'h0;
             end
         end else begin
-            if (opcode == 16'h0001) begin
-                // 1番：ADD命令（足し算）
-                // （※ r0が常に0のハードウェアにするなら if (rd != 0) をつけるとさらに本格的になります！）
-                if (rd != 5'd0) begin
-                    regs[rd] <= regs[rs1] + regs[rs2];
+            // オペコードごとに処理を分岐（ジャンプはPC制御側で終わっているのでここでは不要）
+            case (opcode)
+                16'h0000: begin // NOP
                 end
-            end 
-            else if (opcode == 16'h0002) begin
-                // 2番：即値ロード命令（好きな値をレジスタに突っ込む！）
-                // 32ビットの即値（imm）を64ビットに拡張してレジスタに書き込みます
-                if (rd != 5'd0) begin
-                    regs[rd] <= {32'h0, imm}; // ゼロ拡張する場合
+
+                16'h0001: begin // 32bit即値ロード
+                    if (rd != 5'd0) begin
+                        regs[rd] <= {32'h0, imm};
+                    end
                 end
-            end
+
+                16'h0002: begin // ADD
+                    if (rd != 5'd0) begin
+                        regs[rd] <= regs[rs1] + regs[rs2];
+                    end
+                end
+
+                16'h0003: begin // SUB
+                    if (rd != 5'd0) begin
+                        regs[rd] <= regs[rs1] - regs[rs2];
+                    end
+                end
+
+                16'h0004: begin // 無条件ジャンプ（PCの書き換えは上で完了済みなのでここでは何もしない）
+                end
+
+                default: begin
+                end
+            endcase
         end
     end
 
@@ -89,13 +120,10 @@ module main (
     assign debug_rd     = rd;
     assign debug_rs1    = rs1;
     assign debug_rs2    = rs2;
-    
-    // 今まさに指定されている rd 番号のレジスタの中身をそのまま出力
     assign debug_rd_val = regs[rd];
-
-    // 個別のレジスタ確認用
     assign debug_reg1   = regs[1];
     assign debug_reg2   = regs[2];
     assign debug_reg3   = regs[3];
+    assign debug_pc     = pc;
 
 endmodule
